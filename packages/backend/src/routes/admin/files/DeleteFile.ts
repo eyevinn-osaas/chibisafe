@@ -1,9 +1,7 @@
-import path from 'node:path';
 import type { FastifyReply } from 'fastify';
-import jetpack from 'fs-jetpack';
 import prisma from '@/structures/database.js';
 import type { RequestWithUser } from '@/structures/interfaces.js';
-import { deleteFile, quarantinePath, uploadPath } from '@/utils/File.js';
+import { deleteFiles } from '@/utils/File.js';
 
 export const options = {
 	url: '/admin/file/:uuid',
@@ -20,31 +18,17 @@ export const run = async (req: RequestWithUser, res: FastifyReply) => {
 			quarantine: true
 		},
 		select: {
+			uuid: true,
 			name: true,
 			quarantine: true,
-			quarantineFile: true
+			quarantineFile: true,
+			isS3: true
 		}
 	});
 
 	if (!file) {
 		void res.notFound("The file doesn't exist");
 		return;
-	}
-
-	if (file.quarantine) {
-		await prisma.files.update({
-			where: {
-				uuid
-			},
-			data: {
-				quarantine: false,
-				quarantineFile: {
-					delete: true
-				}
-			}
-		});
-
-		await jetpack.moveAsync(path.join(quarantinePath, file.quarantineFile!.name), path.join(uploadPath, file.name));
 	}
 
 	// Delete the file from the DB
@@ -55,7 +39,7 @@ export const run = async (req: RequestWithUser, res: FastifyReply) => {
 	});
 
 	// Remove the file from disk
-	await deleteFile(file.name);
+	await deleteFiles({ files: [file] });
 
 	return res.send({
 		message: 'Successfully deleted the file'
