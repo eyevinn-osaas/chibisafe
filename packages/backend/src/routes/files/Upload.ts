@@ -1,25 +1,49 @@
-import path from 'node:path';
 import process from 'node:process';
 import { URL, fileURLToPath } from 'node:url';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { processFile } from '@chibisafe/uploader-module';
 import type { FastifyReply } from 'fastify';
-import jetpack from 'fs-jetpack';
 // import { processFile } from '../../../../../../chibisafe-uploader/packages/uploader-module/lib';
+import { z } from 'zod';
 import type { RequestWithUser } from '@/structures/interfaces.js';
+import { http4xxErrorSchema } from '@/structures/schemas/HTTP4xxError.js';
+import { http5xxErrorSchema } from '@/structures/schemas/HTTP5xxError.js';
 import { SETTINGS } from '@/structures/settings.js';
-import {
-	getUniqueFileIdentifier,
-	storeFileToDb,
-	constructFilePublicLink,
-	hashFile,
-	checkFileHashOnDB,
-	deleteTmpFile
-} from '@/utils/File.js';
-import { generateThumbnails } from '@/utils/Thumbnails.js';
+import { getUniqueFileIdentifier, constructFilePublicLink, deleteTmpFile, handleUploadFile } from '@/utils/File.js';
 import { validateAlbum } from '@/utils/UploadHelpers.js';
 import { getUsedQuota } from '@/utils/User.js';
+
+export const schema = {
+	summary: 'Upload file',
+	description: 'Uploads a file',
+	tags: ['Files'],
+	headers: z.object({
+		albumuuid: z.string().optional().describe('The uuid of the album.'),
+		'chibi-chunk-number': z.coerce.number().optional().describe('The chunk number.'),
+		'chibi-chunks-total': z.coerce.number().optional().describe('The total number of chunks.'),
+		'chibi-uuid': z.string().optional().describe('The uuid of the file.')
+	}),
+	body: z
+		.object({
+			size: z.number().describe('The size of the file.'),
+			name: z.string().describe('The name of the file.'),
+			contentType: z.string().describe('The content type of the file.')
+		})
+		.or(z.null()),
+	response: {
+		200: z.object({
+			name: z.string().describe('The name of the file.'),
+			uuid: z.string().describe('The uuid of the file.'),
+			url: z.string().describe('The URL of the file.'),
+			identifier: z.string().optional().describe('The identifier of the file.'),
+			publicUrl: z.string().optional().describe('The public URL of the file.')
+		}),
+		204: z.null(),
+		'4xx': http4xxErrorSchema,
+		'5xx': http5xxErrorSchema
+	}
+};
 
 export const options = {
 	url: '/upload',
@@ -141,46 +165,17 @@ export const run = async (req: RequestWithUser, res: FastifyReply) => {
 
 		const album = await validateAlbum(req.headers.albumuuid as string, req.user ? req.user : undefined);
 
-		// Assign a unique identifier to the file
-		const uniqueIdentifier = await getUniqueFileIdentifier();
-		if (!uniqueIdentifier) throw new Error('Could not generate unique identifier.');
-		const newFileName = String(uniqueIdentifier) + path.extname(upload.metadata.name!);
-		req.log.debug(`> Name for upload: ${newFileName}`);
-
-		// Move file to permanent location
-		const newPath = fileURLToPath(new URL(`../../../../../uploads/${newFileName}`, import.meta.url));
-		const file = {
-			name: newFileName,
-			// @ts-ignore
-			extension: path.extname(upload.metadata.name),
-			path: newPath,
-			// @ts-ignore
-			original: upload.metadata.name as string,
-			// @ts-ignore
-			type: upload.metadata.type as string,
-			// @ts-ignore
-			size: String(upload.metadata.size),
-			hash: await hashFile(upload.path as string),
-			// @ts-ignore
+		const uploadedFile = await handleUploadFile({
+			user: req.user,
 			ip: req.ip,
-			isS3: false
-		};
-
-		let uploadedFile;
-		const fileOnDb = await checkFileHashOnDB(req.user, file);
-		if (fileOnDb?.repeated) {
-			uploadedFile = fileOnDb.file;
-			await deleteTmpFile(upload.path as string);
-		} else {
-			await jetpack.moveAsync(upload.path as string, newPath);
-			// Store file in database
-			const savedFile = await storeFileToDb(req.user ? req.user : undefined, file, album ? album : undefined);
-
-			uploadedFile = savedFile.file;
-
-			// Generate thumbnails
-			void generateThumbnails(savedFile.file.name);
-		}
+			upload: {
+				name: upload.metadata.name,
+				path: upload.path as string,
+				type: upload.metadata.type as string,
+				size: upload.metadata.size ?? '0'
+			},
+			album
+		});
 
 		const linkData = constructFilePublicLink({ req, fileName: uploadedFile.name });
 		// Construct public link

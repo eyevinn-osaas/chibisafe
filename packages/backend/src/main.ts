@@ -6,8 +6,10 @@ import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import fstatic from '@fastify/static';
 import fastify from 'fastify';
+import { jsonSchemaTransform } from 'fastify-type-provider-zod';
 import jetpack from 'fs-jetpack';
 import LiveDirectory from 'live-directory';
+import { cleanup } from 'unzipit';
 import Routes from './structures/routes.js';
 import { SETTINGS, loadSettings } from './structures/settings.js';
 import Docs from './utils/Docs.js';
@@ -16,6 +18,7 @@ import Requirements from './utils/Requirements.js';
 import { jumpstartStatistics } from './utils/StatsGenerator.js';
 import { startUpdateCheckSchedule } from './utils/UpdateCheck.js';
 import { createAdminUserIfNotExists, VERSION } from './utils/Util.js';
+import { fileWatcher, getFileWatcher } from './utils/Watcher.js';
 
 // Create the Fastify server
 const server = fastify({
@@ -26,7 +29,23 @@ const server = fastify({
 	disableRequestLogging: true
 });
 
+const watcher = getFileWatcher();
+
 let htmlBuffer: Buffer | null = null;
+
+process.on('SIGINT', async () => {
+	console.log('SIGINT received...');
+	cleanup();
+	await watcher.close();
+	await server.close();
+});
+
+process.on('SIGTERM', async () => {
+	console.log('SIGTERM received...');
+	cleanup();
+	await watcher.close();
+	await server.close();
+});
 
 // Stray errors and exceptions capturers
 process.on('uncaughtException', error => {
@@ -54,7 +73,15 @@ const start = async () => {
 	await server.register(import('@fastify/sensible'));
 
 	// Create the OpenAPI documentation
-	await server.register(import('@fastify/swagger'), Docs);
+	await server.register(import('@fastify/swagger'), { ...Docs, transform: jsonSchemaTransform });
+	await server.register(import('@scalar/fastify-api-reference'), {
+		routePrefix: '/docs',
+		configuration: {
+			spec: {
+				content: () => server.swagger()
+			}
+		}
+	});
 
 	// Enable cookie parsing
 	await server.register(fastifyCookie, {
@@ -84,7 +111,7 @@ const start = async () => {
 				method: request.method,
 				url: request.url,
 				statusCode: reply.statusCode,
-				responseTime: Math.ceil(reply.getResponseTime()),
+				responseTime: Math.ceil(reply.elapsedTime),
 				ip: request.ip
 			});
 		}
@@ -125,10 +152,14 @@ const start = async () => {
 
 	// Create the neccessary folders
 
+	jetpack.dir(fileURLToPath(new URL('../../../uploads/live', import.meta.url)));
 	jetpack.dir(fileURLToPath(new URL('../../../uploads/tmp', import.meta.url)));
 	jetpack.dir(fileURLToPath(new URL('../../../uploads/zips', import.meta.url)));
 	jetpack.dir(fileURLToPath(new URL('../../../uploads/thumbs/square', import.meta.url)));
 	jetpack.dir(fileURLToPath(new URL('../../../uploads/thumbs/preview', import.meta.url)));
+
+	// Chokidar implementation
+	fileWatcher();
 
 	server.log.debug('Chibisafe is starting with the following configuration:');
 	server.log.debug('');

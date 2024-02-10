@@ -4,11 +4,33 @@ import { Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
 import { URL, fileURLToPath } from 'node:url';
 import type { FastifyReply } from 'fastify';
+import { z } from 'zod';
 import prisma from '@/structures/database.js';
 import type { RequestWithUser } from '@/structures/interfaces.js';
+import { http4xxErrorSchema } from '@/structures/schemas/HTTP4xxError.js';
+import { http5xxErrorSchema } from '@/structures/schemas/HTTP5xxError.js';
+import { responseMessageSchema } from '@/structures/schemas/ResponseMessage.js';
 import { SETTINGS } from '@/structures/settings.js';
 import { deleteTmpFile } from '@/utils/File.js';
 import { generateThumbnails, imageExtensions, videoExtensions } from '@/utils/Thumbnails.js';
+
+export const schema = {
+	summary: 'Regenerate thumbnail',
+	description: 'Regenerates a broken file thumbnail',
+	tags: ['Files'],
+	params: z
+		.object({
+			uuid: z.string().describe('The uuid of the file.')
+		})
+		.required(),
+	response: {
+		200: z.object({
+			message: responseMessageSchema
+		}),
+		'4xx': http4xxErrorSchema,
+		'5xx': http5xxErrorSchema
+	}
+};
 
 export const options = {
 	url: '/file/:uuid/thumbnail/regenerate',
@@ -28,6 +50,7 @@ export const run = async (req: RequestWithUser, res: FastifyReply) => {
 		select: {
 			name: true,
 			isS3: true,
+			isWatched: true,
 			size: true
 		}
 	});
@@ -62,7 +85,7 @@ export const run = async (req: RequestWithUser, res: FastifyReply) => {
 		}
 	}
 
-	void generateThumbnails(file.name, file.isS3);
+	void generateThumbnails({ filename: file.name, tmp: file.isS3, watched: file.isWatched });
 
 	return res.send({
 		message: 'Successfully regenerated file thumbnail'

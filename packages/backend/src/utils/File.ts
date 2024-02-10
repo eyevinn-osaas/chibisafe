@@ -1,9 +1,9 @@
-import path from 'node:path';
+import path, { extname } from 'node:path';
 import process from 'node:process';
 import { URL, fileURLToPath } from 'node:url';
 import { DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import { Blake3Hasher } from '@napi-rs/blake-hash';
 import Zip from 'adm-zip';
-import * as blake3 from 'blake3';
 import type { FastifyRequest } from 'fastify';
 import jetpack from 'fs-jetpack';
 import moment from 'moment';
@@ -13,7 +13,7 @@ import prisma from '@/structures/database.js';
 import type { FileInProgress, RequestUser, User } from '@/structures/interfaces.js';
 import { SETTINGS } from '@/structures/settings.js';
 import { log } from '@/utils/Logger.js';
-import { getFileThumbnail, removeThumbs } from './Thumbnails.js';
+import { generateThumbnails, getFileThumbnail, removeThumbs } from './Thumbnails.js';
 import { getHost } from './Util.js';
 
 const fileIdentifierMaxTries = 5;
@@ -22,6 +22,7 @@ const preserveExtensions = [
 	/\.tar\.\w+/i // tarballs
 ];
 export const uploadPath = fileURLToPath(new URL('../../../../uploads', import.meta.url));
+export const watchPath = fileURLToPath(new URL('../../../../uploads/live', import.meta.url));
 export const tmpUploadPath = fileURLToPath(new URL('../../../../uploads/tmp', import.meta.url));
 export const quarantinePath = fileURLToPath(new URL('../../../../uploads/quarantine', import.meta.url));
 
@@ -76,6 +77,7 @@ export const deleteFiles = async ({
 	deleteFromDB?: boolean;
 	files: {
 		isS3: boolean;
+		isWatched: boolean;
 		name: string;
 		quarantine: boolean;
 		quarantineFile: { name: string } | null;
@@ -121,7 +123,7 @@ export const deleteFiles = async ({
 
 				await jetpack.removeAsync(
 					path.join(
-						file.quarantine ? quarantinePath : uploadPath,
+						file.quarantine ? quarantinePath : file.isWatched ? watchPath : uploadPath,
 						file.quarantine ? file.quarantineFile?.name ?? file.name : file.name
 					)
 				);
@@ -240,10 +242,12 @@ export const constructFilePublicLink = ({
 	req,
 	fileName,
 	quarantine = false,
-	isS3 = false
+	isS3 = false,
+	isWatched = false
 }: {
 	fileName: string;
 	isS3?: boolean;
+	isWatched?: boolean;
 	quarantine?: boolean;
 	req: FastifyRequest;
 }) => {
@@ -251,7 +255,7 @@ export const constructFilePublicLink = ({
 	const data = {
 		url: isS3
 			? `${SETTINGS.S3PublicUrl || SETTINGS.S3Endpoint}${quarantine ? '/quarantine' : ''}/${fileName}`
-			: `${host}${quarantine ? '/quarantine' : ''}/${fileName}`,
+			: `${host}${quarantine ? '/quarantine' : ''}${isWatched ? '/live' : ''}/${fileName}`,
 		thumb: '',
 		thumbSquare: '',
 		preview: ''
@@ -296,6 +300,29 @@ export const checkFileHashOnDB = async (user: RequestUser | User | undefined, fi
 	return null;
 };
 
+export const checkFileNameOnDB = async (user: RequestUser | User | undefined, fileName: string) => {
+	const dbFile = await prisma.files.findFirst({
+		where: {
+			name: fileName,
+			isWatched: true,
+			user: user
+				? {
+						id: user.id
+					}
+				: {}
+		}
+	});
+
+	if (dbFile) {
+		return {
+			file: dbFile,
+			repeated: true
+		};
+	}
+
+	return null;
+};
+
 export const storeFileToDb = async (
 	user: RequestUser | User | undefined,
 	file: FileInProgress,
@@ -313,6 +340,7 @@ export const storeFileToDb = async (
 		hash: file.hash,
 		ip: file.ip,
 		isS3: file.isS3,
+		isWatched: file.isWatched,
 		createdAt: now,
 		editedAt: now
 	};
@@ -347,6 +375,29 @@ export const storeFileToDb = async (
 			}
 		};
 	}
+};
+
+export const updateFileOnDb = async (user: RequestUser | User | undefined, file: FileInProgress & { uuid: string }) => {
+	const now = moment.utc().toDate();
+
+	const data = {
+		userId: user?.id ?? undefined!,
+		name: file.name,
+		original: file.original,
+		type: file.type,
+		size: file.size,
+		hash: file.hash,
+		ip: file.ip,
+		isS3: file.isS3,
+		isWatched: file.isWatched,
+		createdAt: now,
+		editedAt: now
+	};
+
+	return prisma.files.update({
+		where: { uuid: file.uuid, isWatched: true },
+		data
+	});
 };
 
 export const saveFileToAlbum = async (albumId: number, fileId: number) => {
@@ -407,21 +458,72 @@ export const getExtension = (filename: string, lower = false): string => {
 };
 
 export const hashFile = async (uploadPath: string): Promise<string> => {
-	const hash = blake3.createHash();
+	const hasher = new Blake3Hasher();
 	const stream = jetpack.createReadStream(uploadPath);
 	return new Promise((resolve, reject) => {
 		stream.on('data', data => {
-			hash.update(data);
+			hasher.update(data);
 		});
 
 		stream.on('end', () => {
-			resolve(hash.digest('hex'));
-			hash.dispose();
+			resolve(hasher.digest('hex'));
+			hasher.reset();
 		});
 
 		stream.on('error', error => {
 			reject(error);
-			hash.dispose();
+			hasher.reset();
 		});
 	});
+};
+
+export const handleUploadFile = async ({
+	user,
+	ip,
+	upload,
+	album
+}: {
+	album?: number | null | undefined;
+	ip: string;
+	upload: { name: string; path: string; size: string; type: string };
+	user?: RequestUser | User | undefined;
+}) => {
+	// Assign a unique identifier to the file
+	const uniqueIdentifier = await getUniqueFileIdentifier();
+	if (!uniqueIdentifier) throw new Error('Could not generate unique identifier.');
+	const newFileName = String(uniqueIdentifier) + extname(upload.name);
+	log.debug(`> Name for upload: ${newFileName}`);
+
+	// Move file to permanent location
+	const newPath = fileURLToPath(new URL(`../../../../uploads/${newFileName}`, import.meta.url));
+	const file = {
+		name: newFileName,
+		extension: extname(upload.name),
+		path: newPath,
+		original: upload.name,
+		type: upload.type,
+		size: upload.size,
+		hash: await hashFile(upload.path),
+		ip,
+		isS3: false,
+		isWatched: false
+	};
+
+	let uploadedFile;
+	const fileOnDb = await checkFileHashOnDB(user, file);
+	if (fileOnDb?.repeated) {
+		uploadedFile = fileOnDb.file;
+		await deleteTmpFile(upload.path);
+	} else {
+		await jetpack.moveAsync(upload.path, newPath);
+		// Store file in database
+		const savedFile = await storeFileToDb(user ? user : undefined, file, album ? album : undefined);
+
+		uploadedFile = savedFile.file;
+
+		// Generate thumbnails
+		void generateThumbnails({ filename: savedFile.file.name });
+	}
+
+	return uploadedFile;
 };
